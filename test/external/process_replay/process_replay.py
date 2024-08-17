@@ -7,6 +7,7 @@ from typing import Dict, List, cast
 from test.external.process_replay.utils import print_diff
 from tinygrad.codegen.kernel import Kernel
 from tinygrad.helpers import Context, ContextVar, colored, db_connection, VERSION, getenv, tqdm
+from tinygrad.engine.schedule import _graph_schedule
 
 # *** process replay settings
 PAGE_SIZE = 100
@@ -65,16 +66,26 @@ def diff_kernel(offset:int) -> bool:
   cur.close()
   return bool(changed)
 
-def print_ast_diff(offset:int):
+def diff_schedule(offset:int) -> bool:
   conn = db_connection()
   cur = conn.cursor()
   cur.execute(f"SELECT val FROM 'schedule_diff_{VERSION}' LIMIT ? OFFSET ?", (PAGE_SIZE, offset))
-  for row in cur.fetchall():
-    buf, asts = pickle.loads(row[0])
-    if len(asts) == 1:
-      logging.info(f"{buf} was folded")
-      logging.info(asts[0])
-    else: print_diff(asts[0], asts[1])
+  changed = 0
+  for val in cur.fetchall():
+    outs, compare_lsi = pickle.loads(val[0])
+    ref_lsi = {x:lsi for lsi in _graph_schedule(outs, set())[1] for x in lsi.outputs}
+    for compare in compare_lsi:
+      for buf in compare.outputs:
+        if (ref := ref_lsi.get(buf)) is None:
+          logging.info(f"{buf} was folded")
+          logging.info(compare.ast)
+          changed += 1
+          if ASSERT_DIFF: return True
+        elif compare.ast.key != ref.ast.key:
+          changed += 1
+          print_diff(compare.ast, ref.ast)
+          if ASSERT_DIFF: return True
+  return bool(changed)
 
 def get_step_times(data) -> Dict[str, float]:
   tms: Dict[str, float] = {}
@@ -108,21 +119,19 @@ def process_replay():
   if COMPARE_SCHEDULE:
     conn = db_connection()
     cur = conn.cursor()
-    try: has_diff = cur.execute(f"select name from sqlite_master where type='table' and name='schedule_diff_{VERSION}'").fetchone()
+    try: row_count = cur.execute(f"select count(*) from 'schedule_diff_{VERSION}'").fetchone()[0]
     except sqlite3.OperationalError:
       logging.warning(f"schedule_diff_{VERSION} isn't accessible in master, did DB_VERSION change?")
       exit(0)
-    if has_diff:
-      row_count = cur.execute(f"select count(*) from 'schedule_diff_{VERSION}'").fetchone()[0]
-      conn.commit()
-      cur.close()
-      with multiprocessing.get_context("spawn").Pool(multiprocessing.cpu_count(), maxtasksperchild=16) as pool:
-        inputs = list(range(0, row_count, PAGE_SIZE))
-        list(tqdm(pool.imap_unordered(print_ast_diff, inputs), total=len(inputs)))
-        pool.close()
-        pool.join()
-        pool.terminate()
-        if ASSERT_DIFF: raise Exception("kernel process replay detected changes")
+    conn.commit()
+    cur.close()
+    with multiprocessing.get_context("spawn").Pool(multiprocessing.cpu_count(), maxtasksperchild=16) as pool:
+      inputs = list(range(0, row_count, PAGE_SIZE))
+      changed = list(tqdm(pool.imap_unordered(diff_schedule, inputs), total=len(inputs)))
+      pool.close()
+      pool.join()
+      pool.terminate()
+      if any(changed) and ASSERT_DIFF: raise Exception("kernel process replay detected changes")
 
   # *** kernel diff
   conn = db_connection()

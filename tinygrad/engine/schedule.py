@@ -1,11 +1,11 @@
-import sys, pickle, atexit, importlib, contextlib
+import sys, pickle, atexit, uuid, contextlib
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Tuple, List, Dict, Optional, Set, DefaultDict, get_args
 from tinygrad.ops import MetaOps, ReduceOps, UNSAFE_PAD_OPS, UnaryOps, UOp, UOps
 from tinygrad.engine.graph import log_lazybuffer, realized_lazybuffer
 from tinygrad.helpers import GRAPH, DEBUG, MULTIOUTPUT, SAVE_SCHEDULE, FUSE_CONV_BW, FUSE_ARANGE, \
-                             GlobalCounters, colored, prod, dedup, all_int, merge_dicts, getenv, Metadata
+                             GlobalCounters, colored, diskcache_put, prod, dedup, all_int, merge_dicts, getenv, Metadata
 from tinygrad.shape.symbolic import Variable, sint
 from tinygrad.dtype import ConstType, ImageDType, PtrDType, dtypes
 from tinygrad.lazy import LazyBuffer
@@ -377,6 +377,9 @@ def _graph_schedule(outs:List[LazyBuffer], seen:Set[LazyBuffer]) -> \
       with open(fp, "wb") as f: pickle.dump(SCHEDULES, f)
     if len(SCHEDULES) == 0: atexit.register(_save)
     SCHEDULES.append((graph, in_degree))
+  if getenv("RUN_PROCESS_REPLAY") and getenv("COMPARE_SCHEDULE"):
+    # TODO: remove weakrefs from the LazyBuffers pre pickle
+    with contextlib.suppress(Exception): diskcache_put("schedule_diff", str(uuid.uuid4()), (outs, list(in_degree)))
   return graph, in_degree
 
 # *** DAG ordering: breadth first search ***
@@ -384,9 +387,6 @@ def _graph_schedule(outs:List[LazyBuffer], seen:Set[LazyBuffer]) -> \
 def create_schedule_with_vars(outs:List[LazyBuffer], seen:Optional[Set[LazyBuffer]]=None) -> Tuple[List[ScheduleItem], Dict[Variable, int]]:
   if seen is None: seen = set()
   graph, in_degree = _graph_schedule(outs, seen)
-  if getenv("RUN_PROCESS_REPLAY") and getenv("COMPARE_SCHEDULE", 1):
-    # NOTE: process relpay needs PYTHONPATH=., remove this once it just pickles LazyBuffers
-    with contextlib.suppress(Exception): importlib.import_module("test.external.process_replay.diff_schedule").process_replay(outs, graph, in_degree)
 
   queue = deque(lsi for lsi,deg in in_degree.items() if deg == 0)
   schedule: List[ScheduleItem] = []
