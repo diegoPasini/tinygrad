@@ -1,12 +1,13 @@
 # create a diff of two schedule graphs
 import shutil, importlib, uuid, os, logging
 from collections import defaultdict
-from typing import DefaultDict, List, Set, Tuple
+from typing import DefaultDict, Dict, List, Set, Tuple
 from test.external.process_replay.utils import print_diff
 from tinygrad.engine.schedule import LBScheduleItem, ScheduleItem
-from tinygrad.helpers import DEBUG, Context, colored, diskcache_put, fetch, getenv
+from tinygrad.helpers import CI, DEBUG, Context, colored, diskcache_put, fetch, getenv
 from tinygrad.lazy import LazyBuffer
 from tinygrad.engine.realize import CompiledRunner, lower_schedule_item
+from tinygrad.ops import UOp
 
 def process_replay(outs:List[LazyBuffer], graph:DefaultDict[LBScheduleItem, List[LBScheduleItem]], in_degree:DefaultDict[LBScheduleItem, int]):
   # copy the reference module
@@ -28,25 +29,29 @@ def diff_schedule(s:List[Tuple[DefaultDict[LBScheduleItem, List[LBScheduleItem]]
   changed = 0
   seen_diffs: Set[Tuple[bytes, ...]] = set()
   for buf, si in si_for_buf.items():
-    asts = tuple({x.ast.key:x.ast for x in si})
+    asts: Dict[bytes, UOp] = {x.ast.key:x.ast for x in si}
     # kernels didn't change
     if len(si) > 1 and len(asts) == 1: continue
-    if asts in seen_diffs: continue
-    seen_diffs.add(asts)
+    if tuple(asts) in seen_diffs: continue
+    seen_diffs.add(tuple(asts))
     changed += 1
-    if getenv("RUN_PROCESS_REPLAY"): diskcache_put("schedule_diff", str(uuid.uuid4()), (str(buf), [x.ast for x in si]))
+    if getenv("RUN_PROCESS_REPLAY"): diskcache_put("schedule_diff", str(uuid.uuid4()), (str(buf), list(asts.values())))
     if len(asts) == 1:
       print(f"{buf} folded in the second schedule")
-    else: print_si_diff(si[0], si[1])
+    elif not CI: print_si_diff(si[0], si[1])
   if DEBUG >= 1: print(f"*** process replay: {changed} unique kernel{'s' if changed>1 else ''} changed")
   return changed
 
 def print_si_diff(si0:ScheduleItem, si1:ScheduleItem):
   logging.basicConfig(level=logging.INFO)
-  ei0 = lower_schedule_item(si0)
-  ei1 = lower_schedule_item(si1)
-  assert isinstance(ei0.prg, CompiledRunner) and isinstance(ei1.prg, CompiledRunner)
   print_diff(si0.ast, si1.ast)
+  try:
+    ei0 = lower_schedule_item(si0)
+    ei1 = lower_schedule_item(si1)
+  except Exception as e:
+    if DEBUG >= 2: logging.error(f"lowering error {e}")
+    return
+  assert isinstance(ei0.prg, CompiledRunner) and isinstance(ei1.prg, CompiledRunner)
   print_diff(ei0.prg.p.src, ei1.prg.p.src)
   # TODO: create new Buffers for process replay
   if getenv("TIMING"):
