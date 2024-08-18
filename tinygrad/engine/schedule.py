@@ -1,8 +1,9 @@
-import sys, pickle, atexit, importlib, contextlib
+import sys, pickle, atexit, importlib
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Tuple, List, Dict, Optional, Set, DefaultDict, get_args
-from tinygrad.ops import MetaOps, ReduceOps, UNSAFE_PAD_OPS, UnaryOps, UOp, UOps
+from tinygrad.codegen.uopgraph import graph_rewrite
+from tinygrad.ops import BUFFER_UOPS, MetaOps, PatternMatcher, ReduceOps, UNSAFE_PAD_OPS, UPat, UnaryOps, UOp, UOps
 from tinygrad.engine.graph import log_lazybuffer, realized_lazybuffer
 from tinygrad.helpers import GRAPH, DEBUG, MULTIOUTPUT, SAVE_SCHEDULE, FUSE_CONV_BW, FUSE_ARANGE, \
                              GlobalCounters, colored, prod, dedup, all_int, merge_dicts, getenv, Metadata
@@ -11,7 +12,6 @@ from tinygrad.dtype import ConstType, ImageDType, PtrDType, dtypes
 from tinygrad.lazy import LazyBuffer
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.device import Buffer
-from tinygrad.shape.view import View, strides_for_shape
 
 # creation can recurse a lot
 sys.setrecursionlimit(10000)
@@ -93,6 +93,47 @@ def _recursive_uop(buf:LazyBuffer, st:ShapeTracker, outputs:Tuple[LazyBuffer, ..
   if buf.op is UnaryOps.BITCAST: return cache.setdefault((buf, st), UOp(UOps.BITCAST, dtype, in_uops))
   return cache.setdefault((buf, st), UOp(UOps.ALU, dtype, in_uops, buf.op))
 
+# *** helpers for doing movement ops on uop ***
+
+def get_st(u:UOp, cache:Optional[Dict[UOp, ShapeTracker]]=None) -> ShapeTracker:
+  if cache is None: cache = {}
+  if (st:=cache.get(u)): return st
+  if u.op in BUFFER_UOPS: return cache.setdefault(u, u.st_arg)
+  st_src = [get_st(x, cache) for x in u.src]
+  assert len(set(x.shape for x in st_src)) == 1, f"uop has multiple shapes {[x.shape for x in st_src]}"
+  st = ShapeTracker.from_shape(st_src[0].reduce(u.arg[1])) if u.op is UOps.REDUCE_AXIS else st_src[0]
+  return cache.setdefault(u, st)
+
+def reshape(u:UOp, new_shape:Tuple[sint, ...], cache:Optional[Dict[UOp, UOp]]=None) -> UOp:
+  if cache is None: cache = {}
+  if (x:=cache.get(u)): return x
+  if u.op is UOps.SHAPETRACKER: return replace(u, arg=u.arg.reshape(new_shape))
+  new_srcs = tuple(reshape(x, new_shape, cache) for x in u.src)
+  return replace(u, src=new_srcs)
+
+# *** uop reduce fusion ***
+
+def mv_reduce(root:UOp, reduce:UOp) -> Optional[UOp]:
+  output_shape = get_st(reduce).reduce(reduce.arg[1])
+  reshapes = [(x, i, st) for i,x in enumerate(root.src) if x is not reduce and (st:=get_st(x)).shape != output_shape]
+  if len(reshapes) == 0: return None
+  new_srcs = list(root.src)
+  for x,i,xst in reshapes:
+    assert xst.size == prod(output_shape), f"found expanded siblings {xst.size} != {prod(output_shape)}"
+    new_srcs[i] = reshape(x, output_shape)
+  return replace(root, src=new_srcs)
+
+def fixup_store_st(root:UOp) -> Optional[UOp]:
+  output_st = get_st(root.src[2])
+  if output_st.shape == root.st_arg.shape: return None
+  return replace(root, src=(root.src[0], output_st.to_uop(), root.src[2]))
+
+reduce_fusor = PatternMatcher([
+  (UPat({UOps.ALU, UOps.STORE, UOps.CAST, UOps.BITCAST}, src=(UPat(UOps.REDUCE_AXIS, name="reduce"),), name="root", allow_any_len=True), mv_reduce),
+  # (UPat(UOps.REDUCE_AXIS, src=(UPat(UOps.REDUCE_AXIS, name="to_reduce"),), name="root"), combine_double_reduce),
+  (UPat(UOps.STORE, name="root"), fixup_store_st)
+])
+
 def _lower_lazybuffer(outs:List[LazyBuffer], realizes:Dict[LazyBuffer, None]) -> LBScheduleItem:
   """describe the computation for a LazyBuffer with UOp + inputs + var_vals"""
   if (out:=outs[0]).op is MetaOps.COPY and getenv("USE_COPY_KERNEL") and out.device.split(":")[0] == out.srcs[0].device.split(":")[0]:
@@ -119,6 +160,7 @@ def _lower_lazybuffer(outs:List[LazyBuffer], realizes:Dict[LazyBuffer, None]) ->
     ubuf = UOp(UOps.DEFINE_GLOBAL, out.dtype if isinstance(out.dtype, ImageDType) else PtrDType(out.dtype), (), i)
     ast.append(UOp(UOps.STORE, None, (ubuf, output_st.to_uop(), src)))
   sink = UOp(UOps.SINK, None, tuple(ast))
+  sink = graph_rewrite(sink, reduce_fusor)
   return LBScheduleItem(sink, outs, list(inputs), var_vals, dedup([x[0].metadata for x in cache if x[0].metadata and x[0] not in inputs]))
 
 # *** DAG creation: decide which LazyBuffers should realize ***
