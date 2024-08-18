@@ -100,7 +100,7 @@ def get_st(u:UOp, cache:Optional[Dict[UOp, ShapeTracker]]=None) -> ShapeTracker:
   if (st:=cache.get(u)): return st
   if u.op in BUFFER_UOPS: return cache.setdefault(u, u.st_arg)
   st_src = [get_st(x, cache) for x in u.src]
-  assert len(set(x.shape for x in st_src)) == 1, f"uop has multiple shapes:\n{'\n'.join([f"{u.src[i]}, shape={x.shape}" for i,x in enumerate(st_src)])}"
+  assert len(set(x.shape for x in st_src)) == 1, f"uop has mutiple shapes:\n{'\n'.join([f'{x}, shape={st.shape}' for x,st in zip(u.src, st_src)])}"
   st = ShapeTracker.from_shape(st_src[0].reduce(u.arg[1])) if u.op is UOps.REDUCE_AXIS else st_src[0]
   return cache.setdefault(u, st)
 
@@ -121,15 +121,25 @@ def mv_reduce(root:UOp, reduce:UOp) -> Optional[UOp]:
   for x,i,xst in reshapes:
     assert xst.size == prod(output_shape), f"found expanded siblings {xst.size} != {prod(output_shape)}"
     new_srcs[i] = reshape(x, output_shape)
-  return replace(root, src=new_srcs)
+  return replace(root, src=tuple(new_srcs))
 
 def fixup_store_st(root:UOp) -> Optional[UOp]:
   output_st = get_st(root.src[2])
   if output_st.shape == root.st_arg.shape: return None
-  return replace(root, src=(root.src[0], output_st.to_uop(), root.src[2]))
+  return replace(root, src=(root.src[0], ShapeTracker.from_shape(output_st.shape).to_uop(), root.src[2]))
+
+def reshape_srcs(root:UOp) -> Optional[UOp]:
+  if len(root.src) == 1: return None
+  st_src = [get_st(x) for x in root.src]
+  assert len(set(x.size for x in st_src)) == 1, f"uop has expanded srcs:\n{'\n'.join([f'{x}, shape={st.shape}' for x,st in zip(root.src, st_src)])}"
+  if len(set(x.shape for x in st_src)) == 1: return None
+  max_dims = max(st_src, key=lambda x:len(x.shape)).shape
+  new_srcs = [x if st.shape == max_dims else reshape(x, max_dims) for x,st in zip(root.src, st_src)]
+  return replace(root, src=tuple(new_srcs))
 
 reduce_fusor = PatternMatcher([
   (UPat({UOps.ALU, UOps.STORE, UOps.CAST, UOps.BITCAST}, src=(UPat(UOps.REDUCE_AXIS, name="reduce"),), name="root", allow_any_len=True), mv_reduce),
+  (UPat({UOps.ALU, UOps.CAST, UOps.BITCAST}, name="root"), reshape_srcs),
   # (UPat(UOps.REDUCE_AXIS, src=(UPat(UOps.REDUCE_AXIS, name="to_reduce"),), name="root"), combine_double_reduce),
   (UPat(UOps.STORE, name="root"), fixup_store_st)
 ])
