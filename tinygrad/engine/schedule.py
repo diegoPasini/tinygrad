@@ -100,7 +100,7 @@ def get_st(u:UOp, cache:Optional[Dict[UOp, ShapeTracker]]=None) -> ShapeTracker:
   if (st:=cache.get(u)): return st
   if u.op in BUFFER_UOPS: return cache.setdefault(u, u.st_arg)
   st_src = [get_st(x, cache) for x in u.src]
-  assert len(set(x.shape for x in st_src)) == 1, f"uop has multiple shapes {[x.shape for x in st_src]}"
+  assert len(set(x.shape for x in st_src)) == 1, f"uop has multiple shapes:\n{'\n'.join([f"{u.src[i]}, shape={x.shape}" for i,x in enumerate(st_src)])}"
   st = ShapeTracker.from_shape(st_src[0].reduce(u.arg[1])) if u.op is UOps.REDUCE_AXIS else st_src[0]
   return cache.setdefault(u, st)
 
