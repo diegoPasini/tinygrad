@@ -1,4 +1,4 @@
-import sys, pickle, atexit, importlib
+import sys, pickle, atexit, importlib, contextlib
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from typing import Tuple, List, Dict, Optional, Set, DefaultDict, get_args
@@ -12,6 +12,7 @@ from tinygrad.dtype import ConstType, ImageDType, PtrDType, dtypes
 from tinygrad.lazy import LazyBuffer
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.device import Buffer
+from tinygrad.shape.view import View, strides_for_shape
 
 # creation can recurse a lot
 sys.setrecursionlimit(10000)
@@ -80,9 +81,9 @@ def _recursive_uop(buf:LazyBuffer, st:ShapeTracker, outputs:Tuple[LazyBuffer, ..
 
   # reduce ops change ShapeTracker
   if buf.op in ReduceOps:
-    st = ShapeTracker.from_shape(buf.srcs[0].shape)
-    rsrc = _recursive_uop(buf.srcs[0], st, outputs, var_vals, inputs, realizes, assign_targets, cache)
-    return cache.setdefault((buf, st), UOp(UOps.REDUCE_AXIS, dtype, (rsrc,), (buf.op, buf.arg)))
+    src_input = ShapeTracker.from_shape(buf.srcs[0].shape)
+    rsrc = _recursive_uop(buf.srcs[0], src_input, outputs, var_vals, inputs, realizes, assign_targets, cache)
+    return cache.setdefault((buf, src_input), UOp(UOps.REDUCE_AXIS, dtype, (rsrc,), (buf.op, buf.arg, st)))
 
   # elementwise ops pass shapetracker
   in_uops = tuple(_recursive_uop(x, st, outputs, var_vals, inputs, realizes, assign_targets, cache) for x in buf.srcs)
@@ -111,6 +112,18 @@ def reshape(u:UOp, new_shape:Tuple[sint, ...], cache:Optional[Dict[UOp, UOp]]=No
   new_srcs = tuple(reshape(x, new_shape, cache) for x in u.src)
   return replace(u, src=new_srcs)
 
+def push_shapetracker(u:UOp, new_st:ShapeTracker, cache:Optional[Dict[UOp, UOp]]=None) -> UOp:
+  if cache is None: cache = {}
+  if (x:=cache.get(u)): return x
+  if u.op is UOps.SHAPETRACKER: return replace(u, arg=new_st)
+  new_srcs = tuple(push_shapetracker(x, new_st, cache) for x in u.src)
+  return replace(u, src=new_srcs)
+
+def permute_reduce(input_st:ShapeTracker, axis:Tuple[int, ...]) -> Tuple[ShapeTracker, Tuple[sint, ...]]:
+  permute_axis = tuple(i for i in range(len(input_st.shape)) if i not in axis) + axis
+  tmp = input_st.permute(permute_axis)
+  return tmp, tmp.shape[-len(axis):]
+
 # *** uop reduce fusion ***
 
 def mv_reduce(root:UOp, reduce:UOp) -> Optional[UOp]:
@@ -137,7 +150,28 @@ def reshape_srcs(root:UOp) -> Optional[UOp]:
   new_srcs = [x if st.shape == max_dims else reshape(x, max_dims) for x,st in zip(root.src, st_src)]
   return replace(root, src=tuple(new_srcs))
 
+def reduce_push_expand(root:UOp) -> Optional[UOp]:
+  if len(root.arg) == 2: return None
+  arg: Tuple[ReduceOps, Tuple[int, ...], ShapeTracker] = root.arg
+  op, axis, st = arg
+  src = root.src[0]
+  if not st.contiguous:
+    # push the movementop to the src
+    tmp, rshape = permute_reduce(get_st(src), axis)
+    prshape = prod(rshape)
+    strides = strides_for_shape(rshape)
+    nv: List[View] = []
+    for v in st.views:
+      nv.append(View.create(v.shape+rshape, tuple(x*prshape for x in v.strides)+strides,
+                            v.offset*prshape, v.mask+tuple((0,s) for s in rshape) if v.mask is not None else None))
+    src_st = tmp + ShapeTracker(tuple(nv))
+    src = push_shapetracker(src, src_st)
+    _, new_rshape = permute_reduce(src_st, axis)
+    axis = tuple(range(len(src_st.shape)-len(new_rshape), len(src_st.shape)))
+  return replace(root, src=(src,), arg=(op, axis))
+
 reduce_fusor = PatternMatcher([
+  (UPat(UOps.REDUCE_AXIS, name="root"), reduce_push_expand),
   (UPat({UOps.ALU, UOps.STORE, UOps.CAST, UOps.BITCAST}, src=(UPat(UOps.REDUCE_AXIS, name="reduce"),), name="root", allow_any_len=True), mv_reduce),
   (UPat({UOps.ALU, UOps.CAST, UOps.BITCAST}, name="root"), reshape_srcs),
   # (UPat(UOps.REDUCE_AXIS, src=(UPat(UOps.REDUCE_AXIS, name="to_reduce"),), name="root"), combine_double_reduce),
@@ -376,7 +410,7 @@ def create_schedule_with_vars(outs:List[LazyBuffer], seen:Optional[Set[LazyBuffe
   graph, in_degree = _graph_schedule(outs, seen)
   if getenv("RUN_PROCESS_REPLAY") and getenv("COMPARE_SCHEDULE", 1):
     # NOTE: process relpay needs PYTHONPATH=., remove this once it just pickles LazyBuffers
-    importlib.import_module("test.external.process_replay.diff_schedule").process_replay(outs, graph, in_degree)
+    with contextlib.suppress(Exception): importlib.import_module("test.external.process_replay.diff_schedule").process_replay(outs, graph, in_degree)
 
   queue = deque(lsi for lsi,deg in in_degree.items() if deg == 0)
   schedule: List[ScheduleItem] = []
