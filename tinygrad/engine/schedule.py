@@ -2,8 +2,7 @@ import sys, pickle, atexit, importlib, contextlib
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from typing import Tuple, List, Dict, Optional, Set, DefaultDict, get_args
-from tinygrad.codegen.uopgraph import graph_rewrite
-from tinygrad.ops import BUFFER_UOPS, MetaOps, PatternMatcher, ReduceOps, UNSAFE_PAD_OPS, UPat, UnaryOps, UOp, UOps
+from tinygrad.ops import BUFFER_UOPS, MetaOps, PatternMatcher, ReduceOps, UNSAFE_PAD_OPS, UPat, UnaryOps, UOp, UOps, graph_rewrite
 from tinygrad.engine.graph import log_lazybuffer, realized_lazybuffer
 from tinygrad.helpers import GRAPH, DEBUG, MULTIOUTPUT, SAVE_SCHEDULE, FUSE_CONV_BW, FUSE_ARANGE, \
                              GlobalCounters, colored, prod, dedup, all_int, merge_dicts, getenv, Metadata
@@ -101,7 +100,7 @@ def get_st(u:UOp, cache:Optional[Dict[UOp, ShapeTracker]]=None) -> ShapeTracker:
   if (st:=cache.get(u)): return st
   if u.op in BUFFER_UOPS: return cache.setdefault(u, u.st_arg)
   st_src = [get_st(x, cache) for x in u.src]
-  assert len(set(x.shape for x in st_src)) == 1, f"uop has mutiple shapes:\n{'\n'.join([f'{x}, shape={st.shape}' for x,st in zip(u.src, st_src)])}"
+  assert len(set(x.shape for x in st_src)) == 1, f"uop has mutiple shapes: {[f'{x}, shape={st.shape}' for x,st in zip(u.src, st_src)]}"
   st = ShapeTracker.from_shape(st_src[0].reduce(u.arg[1])) if u.op is UOps.REDUCE_AXIS else st_src[0]
   return cache.setdefault(u, st)
 
@@ -144,7 +143,7 @@ def fixup_store_st(root:UOp) -> Optional[UOp]:
 def reshape_srcs(root:UOp) -> Optional[UOp]:
   if len(root.src) == 1: return None
   st_src = [get_st(x) for x in root.src]
-  assert len(set(x.size for x in st_src)) == 1, f"uop has expanded srcs:\n{'\n'.join([f'{x}, shape={st.shape}' for x,st in zip(root.src, st_src)])}"
+  assert len(set(x.size for x in st_src)) == 1, f"uop has expanded srcs: {[f'{x}, shape={st.shape}' for x,st in zip(root.src, st_src)]}"
   if len(set(x.shape for x in st_src)) == 1: return None
   max_dims = max(st_src, key=lambda x:len(x.shape)).shape
   new_srcs = [x if st.shape == max_dims else reshape(x, max_dims) for x,st in zip(root.src, st_src)]
